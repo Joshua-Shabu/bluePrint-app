@@ -1,0 +1,10 @@
+# Xcode
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+.DS_Store
+DerivedData/
+*.xcworkspace/xcuserdata/
+
+# API keys / secrets
+APIConfig.swift
