@@ -40,7 +40,7 @@ enum PlacesService {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(APIConfig.googlePlacesAPIKey, forHTTPHeaderField: "X-Goog-Api-Key")
-        request.setValue("places.displayName,places.formattedAddress", forHTTPHeaderField: "X-Goog-FieldMask")
+        request.setValue("places.id,places.displayName,places.formattedAddress,places.location", forHTTPHeaderField: "X-Goog-FieldMask")
 
         let body: [String: Any] = [
             "maxResultCount": 1,
@@ -84,9 +84,33 @@ enum PlacesService {
             throw PlacesError.noResults
         }
 
+        let name = place.displayName?.text ?? "Unnamed place"
+        let address = place.formattedAddress ?? "Address unavailable"
+        let placeCoordinate = place.location.map {
+            CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude)
+        } ?? coordinate
+
+        // If a Blueprint contributor has already mapped this exact place and
+        // it's been reviewed, show their real floor plan. Any failure here
+        // (no data yet, a network hiccup, whatever) just falls through to the
+        // generic placeholder layout below rather than failing detection.
+        //
+        // Two lookup passes: first by exact Place ID, then — since Google's
+        // Autocomplete/Place Details endpoints (used by the web contributor
+        // tool) and this Nearby Search endpoint occasionally resolve the same
+        // physical business to two different Place IDs — by proximity to the
+        // detected place's own coordinate.
+        if let placeId = place.id,
+           let submission = try? await FirestoreSubmissionService.verifiedSubmission(forPlaceId: placeId) {
+            return Store.fromSubmission(submission, name: name, address: address)
+        }
+        if let submission = try? await FirestoreSubmissionService.verifiedSubmission(near: placeCoordinate) {
+            return Store.fromSubmission(submission, name: name, address: address)
+        }
+
         return Store(
-            name: place.displayName?.text ?? "Unnamed place",
-            address: place.formattedAddress ?? "Address unavailable",
+            name: name,
+            address: address,
             systemImage: "storefront.fill"
         )
     }
@@ -97,8 +121,14 @@ private struct NearbySearchResponse: Decodable {
         struct DisplayName: Decodable {
             let text: String
         }
+        struct Location: Decodable {
+            let latitude: Double
+            let longitude: Double
+        }
+        let id: String?
         let displayName: DisplayName?
         let formattedAddress: String?
+        let location: Location?
     }
     let places: [Place]?
 }

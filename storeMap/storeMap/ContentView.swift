@@ -9,17 +9,41 @@ import SwiftUI
 
 // MARK: - Models
 
-struct Store: Identifiable {
+struct Store: Identifiable, Hashable {
     let id = UUID()
     let name: String
     let address: String
     let systemImage: String
+    var footprint: AnyShape = AnyShape(LShapedFootprint())
+    var pins: [Pin] = fixedLayoutPins
+    // Multi-floor locations (e.g. Jefferson Market Library) list their floors
+    // here; single-floor locations (e.g. Starbucks) leave this empty and the
+    // layout screen falls back to `pins` above with no floor switcher shown.
+    var floors: [StoreFloor] = []
+
+    static func == (lhs: Store, rhs: Store) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+}
+
+struct StoreFloor: Identifiable {
+    let id = UUID()
+    var name: String
+    var pins: [Pin]
+    // Unmapped floors render the same footprint dimmed with only a stairs
+    // pin (back to the mapped floor) and a "not yet mapped" overlay.
+    var isMapped: Bool = true
 }
 
 enum PinKind {
     case entrance
     case fixed
     case custom
+    case stairs
 }
 
 struct Pin: Identifiable {
@@ -30,6 +54,10 @@ struct Pin: Identifiable {
     var yFraction: CGFloat
     var kind: PinKind = .fixed
     var color: Color = .accentColor
+    // Nudges just the label away from the pin dot, for cases where two pins
+    // sit close enough together that their labels would otherwise overlap.
+    // The dot itself still renders at (xFraction, yFraction).
+    var labelOffset: CGSize = .zero
 }
 
 // Warm, coffee-shop brand palette shared by the opening screen and the
@@ -46,8 +74,15 @@ let blueprintGridColor = Color(red: 0.62, green: 0.77, blue: 0.94)
 let blueprintScreenBackground = Color(red: 0.93, green: 0.95, blue: 0.98)
 let blueprintScreenGridColor = Color(red: 0.86, green: 0.90, blue: 0.95)
 
-// The store footprint is an L-shaped polygon (see StoreFootprint). The
-// entrance sits on the bottom "street" wall; every other fixed pin is
+// Muted gray-blue fill/border/grid used for a floor that hasn't been mapped
+// yet, plus the extra opacity reduction applied to the whole layer.
+let blueprintDimmedFillColor = Color(red: 0.76, green: 0.78, blue: 0.82)
+let blueprintDimmedBorderColor = Color(red: 0.40, green: 0.43, blue: 0.47)
+let blueprintDimmedGridColor = Color(red: 0.68, green: 0.71, blue: 0.75)
+let unmappedFloorOpacity: Double = 0.5
+
+// The default store footprint is an L-shaped polygon (see LShapedFootprint).
+// The entrance sits on the bottom "street" wall; every other fixed pin is
 // positioned relative to it (counter just past the door, exit near the
 // front, bin mid-store, restroom tucked in the back corner).
 let entranceFraction = CGPoint(x: 0.5, y: 0.9)
@@ -60,9 +95,29 @@ let fixedLayoutPins: [Pin] = [
     Pin(label: "Restroom", systemImage: "toilet.fill", xFraction: 0.25, yFraction: 0.2, kind: .fixed, color: .blue)
 ]
 
+// Pin layout for the Jefferson Market Library preview: entrance at the
+// bottom point of the footprint, librarian desk and work room in the
+// waist, meeting/reading rooms in the wider facade up top, restroom near
+// the hallway transition where the facade narrows into the waist, and
+// the Monumental Stair right next to the entrance as in the real
+// blueprint. The stair and entrance pins sit close together, so their
+// labels are nudged apart (labelOffset) to avoid overlapping.
+let jeffersonMarketLibraryPins: [Pin] = [
+    Pin(label: "Meeting Room", systemImage: "person.3.fill", xFraction: 0.30, yFraction: 0.20, kind: .fixed, color: .indigo),
+    Pin(label: "Children's Reading Room", systemImage: "book.fill", xFraction: 0.65, yFraction: 0.22, kind: .fixed, color: .orange),
+    Pin(label: "Restroom", systemImage: "toilet.fill", xFraction: 0.62, yFraction: 0.45, kind: .fixed, color: .blue),
+    Pin(label: "Work Room", systemImage: "briefcase.fill", xFraction: 0.55, yFraction: 0.65, kind: .fixed, color: .brown),
+    Pin(label: "Librarian Desk", systemImage: "info.circle.fill", xFraction: 0.48, yFraction: 0.75, kind: .fixed, color: .teal),
+    Pin(label: "Entrance / Vestibule", systemImage: "door.right.hand.open", xFraction: 0.50, yFraction: 0.90, kind: .entrance, color: .green, labelOffset: CGSize(width: 38, height: 0)),
+    Pin(label: "Monumental Stair", systemImage: "figure.stairs", xFraction: 0.38, yFraction: 0.88, kind: .stairs, color: .cyan, labelOffset: CGSize(width: -34, height: 0))
+]
+
 // L-shaped store footprint, expressed as fractions of the available
-// canvas so it scales the same way the pins do.
-struct StoreFootprint: Shape {
+// canvas so it scales the same way the pins do. This is the default shape
+// used by any Store that doesn't specify its own footprint (e.g. a
+// real-world place detected via the Places API, whose actual floor plan
+// we don't know).
+struct LShapedFootprint: Shape {
     static let unitPoints: [CGPoint] = [
         CGPoint(x: 0.1, y: 0.9),
         CGPoint(x: 0.1, y: 0.1),
@@ -86,8 +141,81 @@ struct StoreFootprint: Shape {
     }
 }
 
+// Arbitrary building outline traced by a Blueprint Contributor submission —
+// an ordered list of unit points (0-1, same convention as every other
+// footprint here), rather than a fixed shape like LShapedFootprint.
+struct PolygonFootprint: Shape {
+    var unitPoints: [CGPoint]
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        guard unitPoints.count >= 3 else { return path }
+        let points = unitPoints.map {
+            CGPoint(x: rect.minX + $0.x * rect.width, y: rect.minY + $0.y * rect.height)
+        }
+        path.move(to: points[0])
+        for point in points.dropFirst() {
+            path.addLine(to: point)
+        }
+        path.closeSubpath()
+        return path
+    }
+}
+
+// Jefferson Market Library's Floor 1 footprint: a wide, rounded facade at
+// the top narrowing through a waist down to a point at the entrance,
+// modeled after the building's distinctive silhouette. Expressed as
+// fractions of the available canvas, same convention as LShapedFootprint.
+struct JeffersonMarketLibraryFootprint: Shape {
+    func path(in rect: CGRect) -> Path {
+        func point(_ fx: CGFloat, _ fy: CGFloat) -> CGPoint {
+            CGPoint(x: rect.minX + fx * rect.width, y: rect.minY + fy * rect.height)
+        }
+
+        var path = Path()
+        path.move(to: point(0.12, 0.25))
+        path.addQuadCurve(to: point(0.88, 0.25), control: point(0.5, 0.05))
+        path.addLine(to: point(0.60, 0.55))
+        path.addLine(to: point(0.50, 0.90))
+        path.addLine(to: point(0.40, 0.55))
+        path.addLine(to: point(0.12, 0.25))
+        path.closeSubpath()
+        return path
+    }
+}
+
+// Upper floors haven't been mapped yet: same footprint, dimmed, with
+// only a stairs pin (in the same spot as Floor 1's Monumental Stair)
+// linking back down.
+let unmappedFloorStairsPin = Pin(label: "Stairs", systemImage: "figure.stairs", xFraction: 0.38, yFraction: 0.88, kind: .stairs, color: .cyan)
+
+// Second hardcoded preview location: a curved, waisted building shape
+// instead of the L-shaped one above, with a library-specific pin set and
+// three floors (only Floor 1 is actually mapped out).
+let jeffersonMarketLibrary = Store(
+    name: "Jefferson Market Library",
+    address: "425 6th Ave, New York, NY 10011",
+    systemImage: "books.vertical.fill",
+    footprint: AnyShape(JeffersonMarketLibraryFootprint()),
+    pins: jeffersonMarketLibraryPins,
+    floors: [
+        StoreFloor(name: "Floor 1", pins: jeffersonMarketLibraryPins, isMapped: true),
+        StoreFloor(name: "Floor 2", pins: [unmappedFloorStairsPin], isMapped: false),
+        StoreFloor(name: "Floor 3", pins: [unmappedFloorStairsPin], isMapped: false)
+    ]
+)
+
+// Original hardcoded preview location, kept around (alongside real GPS
+// detection) so both layouts can be tested independently of location
+// services or the Places API.
+let starbucksReservePreview = Store(
+    name: "Starbucks Reserve",
+    address: "17th Ave, New York, NY 10011",
+    systemImage: "cup.and.saucer.fill"
+)
+
 // Graph-paper style grid drawn across the whole canvas; clipped to the
-// StoreFootprint shape so it only shows up inside the building outline.
+// store's footprint shape so it only shows up inside the building outline.
 struct GridPattern: Shape {
     var spacing: CGFloat = 18
 
@@ -195,6 +323,71 @@ struct BuildingLogoMark: View {
     }
 }
 
+extension Store {
+    /// Builds a Store from a real contributor submission fetched from
+    /// Firestore, rather than one of the hardcoded preview layouts. Falls
+    /// back to the default L-shaped footprint if the submission's outline is
+    /// somehow too short to draw (shouldn't happen — the web tool requires
+    /// at least 3 points to close a shape — but better a generic layout than
+    /// a blank floor).
+    static func fromSubmission(_ submission: BlueprintSubmission, name: String, address: String) -> Store {
+        let unitPoints = submission.outline.points.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
+        let footprint: AnyShape = unitPoints.count >= 3
+            ? AnyShape(PolygonFootprint(unitPoints: unitPoints))
+            : AnyShape(LShapedFootprint())
+
+        var pins: [Pin] = []
+        if let entrance = submission.entrance {
+            pins.append(Pin(
+                label: "Entrance",
+                systemImage: "door.right.hand.open",
+                xFraction: CGFloat(entrance.x),
+                yFraction: CGFloat(entrance.y),
+                kind: .entrance,
+                color: .green
+            ))
+        }
+        for facility in submission.facilities {
+            pins.append(Pin(
+                label: facility.label,
+                systemImage: Self.systemImage(forFacilityType: facility.type),
+                xFraction: CGFloat(facility.x),
+                yFraction: CGFloat(facility.y),
+                kind: .fixed,
+                color: Self.color(forFacilityType: facility.type)
+            ))
+        }
+
+        return Store(
+            name: name,
+            address: address,
+            systemImage: "storefront.fill",
+            footprint: footprint,
+            pins: pins
+        )
+    }
+
+    private static func systemImage(forFacilityType type: String) -> String {
+        switch type {
+        case "counter": return "cup.and.saucer.fill"
+        case "restroom": return "toilet.fill"
+        case "bin": return "trash.fill"
+        case "exit": return "door.left.hand.open"
+        default: return "mappin.circle.fill"
+        }
+    }
+
+    private static func color(forFacilityType type: String) -> Color {
+        switch type {
+        case "counter": return Color(red: 0.55, green: 0.35, blue: 0.16)
+        case "restroom": return .blue
+        case "bin": return .gray
+        case "exit": return .red
+        default: return .purple
+        }
+    }
+}
+
 // MARK: - Detecting Location
 
 enum DetectionState {
@@ -205,7 +398,7 @@ enum DetectionState {
 
 struct ContentView: View {
     @State private var detectionState: DetectionState = .loading
-    @State private var showLayout = false
+    @State private var selectedStore: Store?
     @State private var locationService = LocationService()
 
     var body: some View {
@@ -246,7 +439,7 @@ struct ContentView: View {
                         }
 
                         Button {
-                            showLayout = true
+                            selectedStore = store
                         } label: {
                             Text("Enter")
                                 .font(.headline)
@@ -292,17 +485,20 @@ struct ContentView: View {
                 }
 
                 Spacer()
-                Spacer()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(.systemGroupedBackground).ignoresSafeArea())
-            .navigationDestination(isPresented: $showLayout) {
-                if case .success(let store) = detectionState {
-                    StoreLayoutView(store: store)
-                }
+            .navigationDestination(item: $selectedStore) { store in
+                StoreLayoutView(store: store)
             }
             .task {
-                await detectLocation()
+                if ProcessInfo.processInfo.arguments.contains("-PreviewJefferson") {
+                    selectedStore = jeffersonMarketLibrary
+                } else if ProcessInfo.processInfo.arguments.contains("-PreviewStarbucks") {
+                    selectedStore = starbucksReservePreview
+                } else {
+                    await detectLocation()
+                }
             }
         }
     }
@@ -360,9 +556,35 @@ struct StoreLayoutView: View {
     @State private var pendingCanvasSize: CGSize = .zero
     @State private var showingLabelPrompt = false
     @State private var newPinLabel = ""
+    @State private var selectedFloorIndex = 0
+
+    private var hasMultipleFloors: Bool { store.floors.count > 1 }
+    private var currentFloor: StoreFloor? {
+        hasMultipleFloors ? store.floors[selectedFloorIndex] : nil
+    }
+    private var currentPins: [Pin] { currentFloor?.pins ?? store.pins }
+    private var isCurrentFloorMapped: Bool { currentFloor?.isMapped ?? true }
+    private var mappedFloorIndex: Int {
+        store.floors.firstIndex(where: { $0.isMapped }) ?? 0
+    }
 
     var body: some View {
         VStack(spacing: 0) {
+            if hasMultipleFloors {
+                Picker("Floor", selection: $selectedFloorIndex) {
+                    ForEach(Array(store.floors.enumerated()), id: \.offset) { index, floor in
+                        Text(floor.name).tag(index)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
+                .padding(.top, 12)
+                .padding(.bottom, isAddingPin ? 0 : 12)
+                .onChange(of: selectedFloorIndex) {
+                    isAddingPin = false
+                }
+            }
+
             if isAddingPin {
                 Text("Tap anywhere on the layout to drop a pin")
                     .font(.footnote)
@@ -374,26 +596,36 @@ struct StoreLayoutView: View {
 
             GeometryReader { geometry in
                 ZStack {
-                    StoreFootprint()
-                        .fill(blueprintFillColor)
-                        .shadow(color: .black.opacity(0.1), radius: 6, y: 3)
-                    GridPattern()
-                        .stroke(blueprintGridColor, lineWidth: 0.75)
-                        .clipShape(StoreFootprint())
-                    StoreFootprint()
-                        .stroke(blueprintBorderColor, lineWidth: 3)
+                    Group {
+                        store.footprint
+                            .fill(isCurrentFloorMapped ? blueprintFillColor : blueprintDimmedFillColor)
+                            .shadow(color: .black.opacity(0.1), radius: 6, y: 3)
+                        GridPattern()
+                            .stroke(isCurrentFloorMapped ? blueprintGridColor : blueprintDimmedGridColor, lineWidth: 0.75)
+                            .clipShape(store.footprint)
+                        store.footprint
+                            .stroke(isCurrentFloorMapped ? blueprintBorderColor : blueprintDimmedBorderColor, lineWidth: 3)
+                    }
+                    .opacity(isCurrentFloorMapped ? 1 : unmappedFloorOpacity)
 
-                    ForEach(fixedLayoutPins) { pin in
+                    ForEach(currentPins) { pin in
                         pinView(pin, in: geometry.size)
                     }
 
-                    ForEach(customPins) { pin in
-                        pinView(pin, in: geometry.size)
+                    if isCurrentFloorMapped {
+                        ForEach(customPins) { pin in
+                            pinView(pin, in: geometry.size)
+                        }
+                    }
+
+                    if !isCurrentFloorMapped {
+                        unmappedFloorLabel
+                            .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
                     }
                 }
                 .contentShape(Rectangle())
                 .gesture(
-                    isAddingPin ?
+                    isAddingPin && isCurrentFloorMapped ?
                     SpatialTapGesture().onEnded { value in
                         pendingTapLocation = value.location
                         pendingCanvasSize = geometry.size
@@ -415,11 +647,13 @@ struct StoreLayoutView: View {
         )
         .navigationTitle(store.name)
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    isAddingPin.toggle()
-                } label: {
-                    Label("Add Pin", systemImage: "mappin.and.ellipse")
+            if isCurrentFloorMapped {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        isAddingPin.toggle()
+                    } label: {
+                        Label("Add Pin", systemImage: "mappin.and.ellipse")
+                    }
                 }
             }
         }
@@ -432,6 +666,17 @@ struct StoreLayoutView: View {
                 addPendingPin()
             }
         }
+    }
+
+    private var unmappedFloorLabel: some View {
+        Text("Layout not yet mapped")
+            .font(.subheadline.bold())
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(Color(.systemBackground).opacity(0.9))
+            .clipShape(Capsule())
+            .shadow(color: .black.opacity(0.1), radius: 3, y: 1)
     }
 
     private func addPendingPin() {
@@ -472,8 +717,16 @@ struct StoreLayoutView: View {
                 .background(Color(.systemBackground).opacity(0.9))
                 .clipShape(Capsule())
                 .shadow(color: .black.opacity(0.08), radius: 1, y: 1)
+                .fixedSize()
+                .offset(pin.labelOffset)
         }
         .position(x: pin.xFraction * size.width, y: pin.yFraction * size.height)
+        .onTapGesture {
+            guard pin.kind == .stairs, !isCurrentFloorMapped else { return }
+            withAnimation(.easeOut(duration: 0.25)) {
+                selectedFloorIndex = mappedFloorIndex
+            }
+        }
     }
 }
 
